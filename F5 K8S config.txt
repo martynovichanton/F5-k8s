@@ -1,0 +1,436 @@
+https://devcentral.f5.com/s/articles/CIS-and-Kubernetes-Part-1-Install-Kubernetes-and-Calico
+https://devcentral.f5.com/s/articles/calico-kubernetes-and-big-ip-26850
+
+
+
+Step1: Update our systems and install docker
+
+As root on ALL Kubernetes components (Master and Node):
+
+# Install packages to allow apt to use a repository over HTTPS
+apt-get -y update && apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+
+# Add Docker’s official GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+
+# Add Docker apt repository.
+add-apt-repository \
+  "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+  $(lsb_release -cs) \
+  stable"
+
+# Install Docker CE.
+apt-get -y update && apt-get install -y docker-ce=18.06.2~ce~3-0~ubuntu
+Step1: Update our systems and install docker
+# Setup daemon.
+cat > /etc/docker/daemon.json <<EOF
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+
+mkdir -p /etc/systemd/system/docker.service.d
+
+# Restart docker.
+systemctl daemon-reload
+systemctl restart docker
+
+docker run hello-world
+
+***************************************************
+
+Step2: Setup Kubernetes tools (kubeadm, kubelet and kubectl)
+
+As root on ALL Kubernetes components (Master and Node):
+
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+cat <<EOF | tee /etc/apt/sources.list.d/kubernetes.list
+deb https://apt.kubernetes.io/ kubernetes-xenial main
+EOF
+apt-get -y update
+
+apt-get install -qy kubelet=1.14.0-00 kubeadm=1.14.0-00 kubectl=1.14.0-00 kubernetes-cni=0.7.5-00
+apt-mark hold kubelet kubeadm kubectl
+
+***************************************************
+Install Kubernetes
+***************************************************
+
+Step1: Setup Kubernetes with kubeadm
+
+As root on the MASTER node
+
+kubeadm init --apiserver-advertise-address=10.10.12.11 --pod-network-cidr=192.168.0.0/16
+
+Note: SAVE somewhere the kubeadm join command. It is needed to "assimilate" the node later. In my example, it looks like the following (YOURS WILL BE DIFFERENT):
+
+Now you should NOT be ROOT anymore
+
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+***************************************************
+
+Step2: Install the networking component of Kubernetes
+
+kubectl apply -f https://docs.projectcalico.org/v3.8/manifests/calico.yaml
+
+kubectl get pods --all-namespaces
+
+***************************************************
+
+Step3: Add the Node to our Kubernetes Cluster
+
+You must run the following command as ROOT on the Kubernetes NODE 
+
+kubeadm join 10.10.12.11:6443 --token rlbc20.va65z7eauz89mmuv --discovery-token-ca-cert-hash sha256:42eca5bf49c645ff143f972f6bc88a59468a30276f907bf40da3bcf5127c0375
+
+
+On master
+
+kubectl get nodes
+
+***************************************************
+Setup Calico
+***************************************************
+Step1: BIG-IPs Calico setup
+
+Enable dynamic routing on route domain
+Configure BGP
+imish
+enable
+config terminal
+router bgp 64512
+neighbor calico-k8s peer-group
+neighbor calico-k8s remote-as 64512
+neighbor 10.10.12.11 peer-group calico-k8s
+neighbor 10.10.12.12 peer-group calico-k8s
+
+#add the the second machine to BGP if this is a cluster
+#same on the second machine - add the first to BGP
+#neighbor 10.10.12.253 peer-group calico-k8s
+
+write
+end
+
+***************************************************
+
+Step2: Kubernetes Calico setup
+
+On the MASTER node (not as root)
+
+curl -O -L https://github.com/projectcalico/calicoctl/releases/download/v3.10.0/calicoctl
+chmod +x calicoctl
+sudo mv calicoctl /usr/local/bin
+
+sudo mkdir /etc/calico
+
+Create a file /etc/calico/calicoctl.cfg:
+
+apiVersion: projectcalico.org/v3
+kind: CalicoAPIConfig
+metadata:
+spec:
+  datastoreType: "kubernetes"
+  kubeconfig: "/home/anton/.kube/config"
+  
+calicoctl get nodes
+
+
+Calico BGP config
+On the MASTER node:
+
+cat << EOF | calicoctl create -f -
+ apiVersion: projectcalico.org/v3
+ kind: BGPConfiguration
+ metadata:
+   name: default
+ spec:
+   logSeverityScreen: Info
+   nodeToNodeMeshEnabled: true
+   asNumber: 64512
+EOF
+
+cat << EOF | calicoctl create -f -
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: bgppeer-global-bigip1
+spec:
+  peerIP: 10.10.12.254
+  asNumber: 64512
+EOF
+
+calicoctl get bgpPeer
+
+
+
+
+to uninstall kubernetes:
+kubeadm reset
+sudo apt-get purge kubeadm kubectl kubelet kubernetes-cni kube*   
+sudo apt-get autoremove  
+sudo rm -rf ~/.kube
+
+
+
+***************************************************
+Setup ingress controller
+***************************************************
+
+1. Create a Service Account for the BIG-IP Controller
+kubectl create serviceaccount bigip-ctlr -n kube-system
+
+2. Create a Cluster Role and Cluster Role Binding
+
+f5-k8s-sample-rbac.yaml:
+
+# for use in k8s clusters only
+# for OpenShift, use the OpenShift-specific examples
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: bigip-ctlr-clusterrole
+rules:
+- apiGroups: ["", "extensions"]
+  resources: ["nodes", "services", "endpoints", "namespaces", "ingresses", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["", "extensions"]
+  resources: ["configmaps", "events", "ingresses/status"]
+  verbs: ["get", "list", "watch", "update", "create", "patch"]
+- apiGroups: ["", "extensions"]
+  resources: ["secrets"]
+  resourceNames: ["<secret-containing-bigip-login>"]
+  verbs: ["get", "list", "watch"]
+
+---
+
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: bigip-ctlr-clusterrole-binding
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bigip-ctlr-clusterrole
+subjects:
+- apiGroup: ""
+  kind: ServiceAccount
+  name: bigip-ctlr
+  namespace: kube-system
+
+
+
+3. Create secret file secret.yaml
+apiVersion: v1
+items:
+- apiVersion: v1
+  data:
+    password: YWRtaW4=
+    url: MTAuMTAuMTIuMjU0
+    username: YWRtaW4=
+  kind: Secret
+  metadata:
+    name: bigip-credentials
+    namespace: kube-system
+  type: Opaque
+kind: List
+metadata: {}
+
+kubect create -f secret.yaml
+
+
+4. Upload the Deployment, Cluster Role, and Cluster Role Binding to the Kubernetes API server using kubectl apply
+
+f5-k8s-bigip-ctlr.yaml:
+
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: k8s-bigip-ctlr-deployment
+  namespace: kube-system
+spec:
+  # DO NOT INCREASE REPLICA COUNT
+  replicas: 1
+  template:
+    metadata:
+      name: k8s-bigip-ctlr
+      labels:
+        app: k8s-bigip-ctlr
+    spec:
+      # Name of the Service Account bound to a Cluster Role with the required
+      # permissions
+      serviceAccountName: bigip-ctlr
+      containers:
+        - name: k8s-bigip-ctlr
+          image: "f5networks/k8s-bigip-ctlr"
+          env:
+            # Get sensitive values from the bigip-credentials secret
+            - name: BIGIP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: bigip-credentials
+                  key: username
+            - name: BIGIP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bigip-credentials
+                  key: password
+            - name: BIGIP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bigip-credentials
+                  key: url
+          command: ["/app/bin/k8s-bigip-ctlr"]
+          args: [
+            # See the k8s-bigip-ctlr documentation for information about
+            # all config options
+            # https://clouddocs.f5.com/products/connectors/k8s-bigip-ctlr/latest
+            "--bigip-url=$(BIGIP_URL)",
+            "--bigip-username=$(BIGIP_USERNAME)",
+            "--bigip-password=$(BIGIP_PASSWORD)",
+            "--bigip-partition=k8s",
+            "--namespace=default",
+            "--pool-member-type=cluster",
+            "--manage-configmaps=true",
+            "--insecure=true"
+            ]
+      imagePullSecrets:
+        # Secret that gives access to a private docker registry
+        - name: f5-docker-images
+        # Secret containing the BIG-IP system login credentials
+        - name: bigip-login
+
+
+
+kubectl apply -f f5-k8s-bigip-ctlr.yaml -f f5-k8s-sample-rbac.yaml -n kube-system
+
+
+
+5. Create config map
+
+f5-hello-world-as3-configmap.yaml:
+
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: f5-as3-declaration
+  namespace: default
+  labels:
+    f5type: virtual-server
+    as3: "true"
+data:
+  template: |
+    {
+        "class": "AS3",
+        "declaration": {
+            "class": "ADC",
+            "schemaVersion": "3.10.0",
+            "id": "urn:uuid:33045210-3ab8-4636-9b2a-c98d22ab915d",
+            "label": "http",
+            "remark": "Simple HTTP application with RR pool",
+            "updateMode": "selective",
+            "k8s": {
+                "class": "Tenant",
+                "defaultRouteDomain": 1, 
+                "A1": {
+                    "class": "Application",
+                    "template": "generic",
+                    "ingress": {
+                        "class": "Service_HTTP",
+                        "virtualAddresses": [
+                            "10.10.13.102"
+                        ],
+                        "pool": "web_pool"
+                    },
+                    "web_pool": {
+                        "class": "Pool",
+                        "monitors": [
+                            "http"
+                        ],
+                        "members": [
+                            {
+                                "servicePort": 8080,
+                                "serverAddresses": []
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+
+kubectl create -f f5-hello-world-as3-configmap.yaml
+
+
+6. Create deployment and service
+ 
+f5-hello-world-web-deployment.yaml:
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: f5-hello-world-web
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: f5-hello-world-web
+  template:
+    metadata:
+      labels:
+        app: f5-hello-world-web
+    spec:
+      containers:
+      - env:
+        - name: service_name
+          value: f5-hello-world-web
+        image: f5devcentral/f5-hello-world:latest
+        imagePullPolicy: Always
+        name: f5-hello-world-web
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+
+
+
+f5-hello-world-web-service.yaml:
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: f5-hello-world-web
+  namespace: default
+  labels:
+    app: f5-hello-world-web
+    cis.f5.com/as3-tenant: k8s
+    cis.f5.com/as3-app: A1
+    cis.f5.com/as3-pool: web_pool
+spec:
+  ports:
+  - name: f5-hello-world-web
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+  type: NodePort
+  selector:
+    app: f5-hello-world-web
+
+
+kubectl apply -f f5-hello-world-web-deployment.yaml
+kubectl apply -f f5-hello-world-web-service.yaml
+
+
+Once the service is create on the k8s the controller creates it on the F5
+
+
+

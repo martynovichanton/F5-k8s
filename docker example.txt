@@ -1,0 +1,12 @@
+sudo docker build -t martynovichanton/hello .
+sudo docker run -a stdin -a stdout -i -t  martynovichanton/hello /bin/bash
+sudo docker push martynovichanton/hello
+
+kubectl run web --image=martynovichanton/hello --port=8080
+kubectl expose deployment web --target-port=8080 --type=NodePort
+kubectl get service web
+kubectl apply -f example-ingress.yaml
+kubectl get ingress
+curl hello-world.info
+
+
